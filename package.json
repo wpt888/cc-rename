@@ -1,0 +1,31 @@
+{
+  "name": "cc-rename",
+  "version": "1.0.0",
+  "description": "Auto-names every Claude Code session from its own conversation — a UserPromptSubmit hook that sets the sessionTitle so you never run /rename by hand.",
+  "bin": {
+    "cc-rename": "auto-rename.js"
+  },
+  "main": "auto-rename.js",
+  "scripts": {
+    "demo": "node auto-rename.js"
+  },
+  "keywords": [
+    "claude-code",
+    "hook",
+    "session",
+    "rename",
+    "sessionTitle",
+    "UserPromptSubmit",
+    "cli"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=16"
+  },
+  "files": [
+    "auto-rename.js",
+    "install.ps1",
+    "README.md",
+    "LICENSE"
+  ]
+}
