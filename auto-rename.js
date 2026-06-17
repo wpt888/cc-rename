@@ -2,42 +2,51 @@
 'use strict';
 
 /*
- * cc-rename — auto-names each Claude Code session.
+ * cc-rename — auto-names each Claude Code session from its own conversation.
  *
  * This is a `UserPromptSubmit` hook. On every prompt it reads the session's own
- * transcript and, once there is real conversation context, asks a fast model to
- * coin a short kebab-case title, then returns it via
+ * transcript and, once there is real context, sets a short kebab-case title via
  *   { hookSpecificOutput: { hookEventName: "UserPromptSubmit", sessionTitle } }
- * which Claude Code uses to rename the session — exactly what `/rename` does by
- * hand, but automatic and per-session.
+ * exactly what `/rename` does by hand, but automatic and per-session.
  *
- * Two mandatory gates keep it safe and one-shot:
- *   Gate A — if the transcript already contains a `custom-title` entry (a manual
- *            /rename OR our own prior rename) we never touch it again. This makes
- *            the hook self-disabling after the first success and respects the user.
- *   Gate B — only act once at least one assistant response exists, so the title
- *            is generated from meaningful context (and a brand-new headless child
- *            session — see anti-recursion below — has none, so it self-skips).
+ * NON-BLOCKING by design. A UserPromptSubmit hook BLOCKS the user's prompt until
+ * it returns, so it must be fast. Generating a name with `claude -p` takes
+ * several seconds (and can exceed the hook timeout on a cold start), so we never
+ * do it inline. Instead:
  *
- * Anti-recursion: the name is produced by spawning `claude -p --model haiku`,
- * which is itself a Claude session that fires UserPromptSubmit hooks. We spawn it
- * with CC_RENAME_CHILD=1 and bail immediately when we see that flag, so the child
- * can never spawn a grandchild. Gate B is a second, independent guard.
+ *   - The hook is a sub-100ms cache read/write. It returns immediately.
+ *   - The first time a session has context, the hook spawns a DETACHED worker
+ *     (this same file with `--generate`) that runs `claude -p --model haiku` in
+ *     the background and writes the name to a per-session cache file. The hook
+ *     returns with no output that fire.
+ *   - On the next prompt, the hook finds the cached name and emits it as the
+ *     sessionTitle instantly. So the rename lands one prompt after the first,
+ *     with zero blocking and no dependency on `claude -p` beating a timeout.
  *
- * Zero dependencies. Reads stdin JSON (the hook contract), writes JSON to stdout
- * only when it actually sets a title; otherwise it stays silent and exits 0 so it
- * never injects spurious context or breaks the prompt.
+ * Safety / one-shot:
+ *   Gate A — if the transcript already has a `custom-title` entry (a manual
+ *            /rename OR our own applied rename) we never touch it again.
+ *   Cache  — once we emit a title we mark the cache `applied` and stop, so we
+ *            rename at most once per session even before CC writes custom-title.
  *
- * Debug: set CC_RENAME_DEBUG=1 to append a trace to ~/.claude/cc-rename.log.
+ * Anti-recursion: the worker spawns `claude -p`, itself a Claude session that
+ * fires UserPromptSubmit hooks. The worker runs claude with CC_RENAME_CHILD=1
+ * and the hook bails instantly on that flag, so a child can never spawn a
+ * grandchild.
+ *
+ * Zero dependencies. Debug: set CC_RENAME_DEBUG=1 to trace to ~/.claude/cc-rename.log.
  */
 
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { spawnSync } = require('child_process');
+const { spawnSync, spawn } = require('child_process');
 
+const HOME = os.homedir();
 const DEBUG = process.env.CC_RENAME_DEBUG === '1';
-const LOG_PATH = path.join(os.homedir(), '.claude', 'cc-rename.log');
+const LOG_PATH = path.join(HOME, '.claude', 'cc-rename.log');
+const CACHE_DIR = path.join(HOME, '.claude', '.cc-rename');
+const PENDING_STALE_MS = 90 * 1000; // a worker that hasn't finished in 90s is dead; retry.
 
 function log(...parts) {
   if (!DEBUG) return;
@@ -93,7 +102,7 @@ function cleanUserText(text) {
   return s.replace(/\s+/g, ' ').trim();
 }
 
-// Scan the JSONL transcript once and return the few facts the gates need.
+// Scan the JSONL transcript once and return the few facts we need.
 function analyzeTranscript(transcriptPath) {
   const out = {
     hasCustomTitle: false,
@@ -146,7 +155,7 @@ function analyzeTranscript(transcriptPath) {
   return out;
 }
 
-// ---- name generation --------------------------------------------------------
+// ---- name generation (runs only in the detached worker) ---------------------
 
 function buildPrompt(userText, assistantText) {
   const u = userText.slice(0, 1500);
@@ -172,9 +181,7 @@ function buildPrompt(userText, assistantText) {
     .join('\n');
 }
 
-// Normalize whatever the model returns into a safe kebab-case slug.
-// Returns '' when nothing usable remains (caller then stays silent and retries
-// on the next prompt, since no custom-title has been written yet).
+// Normalize whatever the model returns into a safe kebab-case slug ('' if none).
 function sanitize(raw) {
   let s = String(raw).replace(/^﻿/, '').trim();
   s = (s.split(/\r?\n/).find((l) => l.trim()) || '').trim();
@@ -197,7 +204,7 @@ function generateName(userText, assistantText) {
     res = spawnSync('claude', ['-p', '--model', 'haiku'], {
       input: prompt,
       encoding: 'utf8',
-      timeout: 25000,
+      timeout: 60000, // generous: we're detached, nothing is waiting on us.
       maxBuffer: 4 * 1024 * 1024,
       windowsHide: true,
       // shell:true is required on Windows to invoke claude.cmd (Node refuses to
@@ -223,12 +230,85 @@ function generateName(userText, assistantText) {
   return sanitize(res.stdout || '');
 }
 
-// ---- main -------------------------------------------------------------------
+// ---- per-session cache ------------------------------------------------------
 
-function main() {
-  // Anti-recursion: a name-generating child must never rename anything itself.
-  if (process.env.CC_RENAME_CHILD === '1') return;
+function cacheFileFor(sessionId) {
+  const safe = String(sessionId).replace(/[^a-zA-Z0-9_-]/g, '_');
+  return path.join(CACHE_DIR, safe + '.json');
+}
 
+function readCache(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (_) {
+    return null;
+  }
+}
+
+function writeCache(file, obj) {
+  try {
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(obj));
+    return true;
+  } catch (e) {
+    log('cache write failed', e && e.message);
+    return false;
+  }
+}
+
+function removeCache(file) {
+  try {
+    fs.unlinkSync(file);
+  } catch (_) {
+    /* already gone */
+  }
+}
+
+// ---- detached worker: generate the name and cache it ------------------------
+
+function runGenerator(sessionId, transcriptPath) {
+  const file = cacheFileFor(sessionId);
+  const info = analyzeTranscript(transcriptPath);
+
+  if (info.hasCustomTitle) {
+    // User renamed (or we already did) while we were starting — stand down.
+    removeCache(file);
+    return;
+  }
+  if (!info.firstUserText) {
+    removeCache(file); // nothing to name yet; let a later fire restart us.
+    return;
+  }
+
+  const name = generateName(info.firstUserText, info.firstAssistantText);
+  if (name) {
+    writeCache(file, { status: 'ready', name: name, ts: Date.now() });
+    log('worker cached name:', name, 'for', sessionId);
+  } else {
+    removeCache(file); // failed; a later fire will restart generation.
+    log('worker produced no name for', sessionId);
+  }
+}
+
+// Launch the worker fully detached so the hook returns instantly.
+function spawnWorker(sessionId, transcriptPath) {
+  try {
+    const child = spawn(process.execPath, [__filename, '--generate', sessionId, transcriptPath], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    child.unref();
+    return true;
+  } catch (e) {
+    log('failed to spawn worker', e && e.message);
+    return false;
+  }
+}
+
+// ---- hook mode --------------------------------------------------------------
+
+function runHook() {
   let data = {};
   try {
     data = JSON.parse(readStdin().replace(/^﻿/, '') || '{}');
@@ -237,45 +317,77 @@ function main() {
   }
 
   const transcriptPath = data.transcript_path;
-  if (!transcriptPath) {
-    log('no transcript_path; skip');
+  const sessionId = data.session_id;
+  if (!transcriptPath || !sessionId) {
+    log('missing transcript_path or session_id; skip');
     return;
   }
 
   const info = analyzeTranscript(transcriptPath);
 
-  // Gate A — already named (manual /rename or our own prior rename): never touch.
+  // Gate A — already named (manual /rename or our own applied rename): never touch.
   if (info.hasCustomTitle) {
     log('gate A: already has custom-title; skip');
     return;
   }
 
-  // Gate B — need at least one assistant response for meaningful context.
-  if (info.assistantCount < 1) {
-    log('gate B: no assistant context yet; skip');
+  const file = cacheFileFor(sessionId);
+  const cache = readCache(file);
+
+  if (cache && cache.status === 'applied') {
+    log('already applied this session; skip');
     return;
   }
 
+  if (cache && cache.status === 'ready' && cache.name) {
+    // Emit instantly and mark applied so we rename at most once.
+    writeCache(file, { status: 'applied', name: cache.name, ts: Date.now() });
+    log('emitting sessionTitle:', cache.name);
+    process.stdout.write(
+      JSON.stringify({
+        hookSpecificOutput: {
+          hookEventName: 'UserPromptSubmit',
+          sessionTitle: cache.name,
+        },
+      })
+    );
+    return;
+  }
+
+  if (cache && cache.status === 'pending') {
+    if (Date.now() - (cache.ts || 0) < PENDING_STALE_MS) {
+      log('generation pending; wait');
+      return;
+    }
+    log('stale pending; restarting generation');
+    // fall through to restart
+  }
+
+  // No usable cache: start generation if we have enough context.
   if (!info.firstUserText) {
-    log('no user text found; skip');
+    log('no substantive user text yet; wait');
     return;
   }
 
-  const name = generateName(info.firstUserText, info.firstAssistantText);
-  if (!name) {
-    log('empty name; skip (will retry next prompt)');
+  writeCache(file, { status: 'pending', ts: Date.now() });
+  spawnWorker(sessionId, transcriptPath);
+  log('started detached generation for', sessionId);
+}
+
+// ---- entry ------------------------------------------------------------------
+
+function main() {
+  // Detached worker mode: `node auto-rename.js --generate <sessionId> <transcript>`.
+  const gi = process.argv.indexOf('--generate');
+  if (gi !== -1) {
+    runGenerator(process.argv[gi + 1], process.argv[gi + 2]);
     return;
   }
 
-  log('setting sessionTitle:', name);
-  process.stdout.write(
-    JSON.stringify({
-      hookSpecificOutput: {
-        hookEventName: 'UserPromptSubmit',
-        sessionTitle: name,
-      },
-    })
-  );
+  // Hook mode. Anti-recursion: a name-generating child must never rename anything.
+  if (process.env.CC_RENAME_CHILD === '1') return;
+
+  runHook();
 }
 
 main();
