@@ -43,8 +43,11 @@ const path = require('path');
 const { spawnSync, spawn } = require('child_process');
 
 const HOME = os.homedir();
-const DEBUG = process.env.CC_RENAME_DEBUG === '1';
 const LOG_PATH = path.join(HOME, '.claude', 'cc-rename.log');
+// Debug activates via env OR a flag file (the flag works inside the live hook,
+// where setting an env var is awkward): touch ~/.claude/.cc-rename-debug
+const DEBUG =
+  process.env.CC_RENAME_DEBUG === '1' || fs.existsSync(path.join(HOME, '.claude', '.cc-rename-debug'));
 const CACHE_DIR = path.join(HOME, '.claude', '.cc-rename');
 const PENDING_STALE_MS = 90 * 1000; // a worker that hasn't finished in 90s is dead; retry.
 
@@ -316,10 +319,13 @@ function runHook() {
     data = {};
   }
 
-  const transcriptPath = data.transcript_path;
-  const sessionId = data.session_id;
+  if (DEBUG) log('hook fired; stdin keys = [' + Object.keys(data).join(', ') + ']');
+
+  // Field names defensively: Claude Code has used snake_case; accept variants.
+  const transcriptPath = data.transcript_path || data.transcriptPath;
+  const sessionId = data.session_id || data.sessionId;
   if (!transcriptPath || !sessionId) {
-    log('missing transcript_path or session_id; skip');
+    log('missing transcript_path or session_id; skip. keys=[' + Object.keys(data).join(', ') + ']');
     return;
   }
 
