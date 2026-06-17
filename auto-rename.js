@@ -61,7 +61,8 @@ function readStdin() {
 // ---- transcript analysis ----------------------------------------------------
 
 // Pull plain text out of a message `content` that may be a string or an array
-// of content blocks ({ type, text }, tool_result, etc.).
+// of content blocks ({ type, text }, thinking, tool_result, etc.). Only real
+// text blocks contribute — thinking/tool blocks have no `text` and are ignored.
 function extractText(content) {
   if (typeof content === 'string') return content;
   if (Array.isArray(content)) {
@@ -75,6 +76,21 @@ function extractText(content) {
       .join(' ');
   }
   return '';
+}
+
+// The first `user` entry is frequently NOT the user's intent — it's an injected
+// wrapper (slash-command caveats, system reminders, command stdout). Strip those
+// blocks so the title reflects the real request, not boilerplate. What survives
+// for a slash command (e.g. the /goal name + args) is genuine signal, so we keep
+// tag *contents* and only drop the noise blocks and the tags themselves.
+function cleanUserText(text) {
+  let s = String(text);
+  s = s.replace(/<local-command-caveat>[\s\S]*?<\/local-command-caveat>/gi, ' ');
+  s = s.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, ' ');
+  s = s.replace(/<command-message>[\s\S]*?<\/command-message>/gi, ' ');
+  s = s.replace(/<local-command-stdout>[\s\S]*?<\/local-command-stdout>/gi, ' ');
+  s = s.replace(/<\/?[a-z][a-z0-9-]*>/gi, ' '); // drop remaining tags, keep their text
+  return s.replace(/\s+/g, ' ').trim();
 }
 
 // Scan the JSONL transcript once and return the few facts the gates need.
@@ -112,14 +128,16 @@ function analyzeTranscript(transcriptPath) {
     }
 
     if (obj.type === 'user') {
+      // Keep scanning until we find a user turn with substantive intent (not a
+      // pure caveat/reminder wrapper). 12 chars filters out empty/noise turns.
       if (!out.firstUserText) {
-        const text = extractText(obj.message && obj.message.content).trim();
-        if (text) out.firstUserText = text;
+        const text = cleanUserText(extractText(obj.message && obj.message.content));
+        if (text.length >= 12) out.firstUserText = text;
       }
     } else if (obj.type === 'assistant') {
       out.assistantCount += 1;
       if (!out.firstAssistantText) {
-        const text = extractText(obj.message && obj.message.content).trim();
+        const text = extractText(obj.message && obj.message.content).replace(/\s+/g, ' ').trim();
         if (text) out.firstAssistantText = text;
       }
     }
