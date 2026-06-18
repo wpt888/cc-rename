@@ -329,18 +329,25 @@ function applyToRoster(sessionId, name) {
 function runGenerator(sessionId, transcriptPath) {
   const file = cacheFileFor(sessionId);
   const info = analyzeTranscript(transcriptPath);
+  const cache = readCache(file);
+  // Seed captured by the hook at fire time (the prompt the user just typed).
+  // UserPromptSubmit fires BEFORE the prompt is in the transcript, so on the
+  // first prompt this seed is the only text we have to name from.
+  const seed = (cache && cache.seedPrompt) || '';
 
   if (info.hasCustomTitle) {
     // User renamed (or we already did) while we were starting — stand down.
     removeCache(file);
     return;
   }
-  if (!info.firstUserText) {
+
+  const userText = info.firstUserText || seed;
+  if (!userText) {
     removeCache(file); // nothing to name yet; let a later fire restart us.
     return;
   }
 
-  const name = generateName(info.firstUserText, info.firstAssistantText);
+  const name = generateName(userText, info.firstAssistantText);
   if (name) {
     writeCache(file, { status: 'ready', name: name, ts: Date.now() });
     log('worker cached name:', name, 'for', sessionId);
@@ -430,15 +437,25 @@ function runHook() {
     // fall through to restart
   }
 
-  // No usable cache: start generation if we have enough context.
-  if (!info.firstUserText) {
+  // Seed from the just-typed prompt (stdin) when the transcript has no user text
+  // yet. UserPromptSubmit fires BEFORE the prompt is appended to the transcript,
+  // so on the FIRST prompt info.firstUserText is empty — without this seed,
+  // generation wouldn't start until the SECOND prompt and a single-prompt session
+  // would never get named.
+  const stdinSeed = cleanUserText(extractText(data.prompt));
+  const seed = info.firstUserText || (stdinSeed.length >= 12 ? stdinSeed : '');
+
+  // No usable text yet: wait for a later fire.
+  if (!seed) {
     log('no substantive user text yet; wait');
     return;
   }
 
-  writeCache(file, { status: 'pending', ts: Date.now() });
+  // Store the seed so the detached worker can name from it even if the transcript
+  // write is still racing behind us.
+  writeCache(file, { status: 'pending', ts: Date.now(), seedPrompt: seed });
   spawnWorker(sessionId, transcriptPath);
-  log('started detached generation for', sessionId);
+  log('started detached generation for', sessionId, '(seeded from', info.firstUserText ? 'transcript)' : 'stdin prompt)');
 }
 
 // ---- entry ------------------------------------------------------------------
