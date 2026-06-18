@@ -4,30 +4,32 @@
 /*
  * cc-rename — auto-names each Claude Code session from its own conversation.
  *
- * This is a `UserPromptSubmit` hook. On every prompt it reads the session's own
- * transcript and, once there is real context, sets a short kebab-case title via
+ * This is a `UserPromptSubmit` hook. On the first prompt it reads the session's
+ * own context and sets a short kebab-case title via
  *   { hookSpecificOutput: { hookEventName: "UserPromptSubmit", sessionTitle } }
  * exactly what `/rename` does by hand, but automatic and per-session.
  *
- * NON-BLOCKING by design. A UserPromptSubmit hook BLOCKS the user's prompt until
- * it returns, so it must be fast. Generating a name with `claude -p` takes
- * several seconds (and can exceed the hook timeout on a cold start), so we never
- * do it inline. Instead:
+ * WHY THE HOOK GENERATES THE NAME INLINE. The live title shown on a running pane
+ * is held in Claude Code's MEMORY. The only channel that updates it is a hook
+ * emitting `sessionTitle` — and the only such hook that fires during a live
+ * session is `UserPromptSubmit`. An external process (e.g. a background worker)
+ * can write the roster file `~/.claude/sessions/<pid>.json`, which updates the
+ * /resume list, but it CANNOT touch the live pane's label. So to rename after the
+ * very FIRST prompt, the hook must produce the title itself, that fire.
  *
- *   - The hook is a sub-100ms cache read/write. It returns immediately.
- *   - The first time a session has context, the hook spawns a DETACHED worker
- *     (this same file with `--generate`) that runs `claude -p --model haiku` in
- *     the background and writes the name to a per-session cache file. The hook
- *     returns with no output that fire.
- *   - When the worker finishes (~15-20s later) it ALSO writes the name straight
- *     into the session's roster file (~/.claude/sessions/<pid>.json `name`), which
- *     CC reflects in the live UI. So the rename lands after the FIRST prompt — no
- *     second prompt needed. It's a read-merge-write, guarded to only fill an empty
- *     `name`, so a manual /rename is never clobbered.
- *   - On the next prompt, the hook also emits the cached name as the sessionTitle.
- *     This is the durable layer: it writes a `custom-title` transcript entry (the
- *     roster write does not) and marks the session applied, so the rename is
- *     permanent and fires at most once. Zero blocking, no `claude -p` timeout race.
+ * Flow:
+ *   - On the first prompt with real context, the hook generates the name inline
+ *     with `claude -p --model haiku` (your SUBSCRIPTION, not the API) and emits it
+ *     as `sessionTitle`. The pane renames immediately. The naming text is seeded
+ *     from the `prompt` field of the hook's stdin payload, because UserPromptSubmit
+ *     fires BEFORE the prompt is written to the transcript. This blocks the first
+ *     prompt for a few seconds — ONCE per session; afterwards the hook is instant.
+ *   - Fallback: if inline generation is too slow (it's capped under the hook
+ *     timeout) or fails, the hook spawns a DETACHED worker that caches the name in
+ *     the background; the NEXT prompt's hook emits it. So the rename still lands,
+ *     just one prompt later, and a slow/cold `claude -p` never breaks your prompt.
+ *   - Either path also writes the roster `name` (best-effort, guarded to only fill
+ *     an empty name) so the /resume list shows it too, across CC versions.
  *
  * Safety / one-shot:
  *   Gate A — if the transcript already has a `custom-title` entry (a manual
@@ -35,10 +37,10 @@
  *   Cache  — once we emit a title we mark the cache `applied` and stop, so we
  *            rename at most once per session even before CC writes custom-title.
  *
- * Anti-recursion: the worker spawns `claude -p`, itself a Claude session that
- * fires UserPromptSubmit hooks. The worker runs claude with CC_RENAME_CHILD=1
- * and the hook bails instantly on that flag, so a child can never spawn a
- * grandchild.
+ * Anti-recursion: naming spawns `claude -p`, itself a Claude session that fires
+ * UserPromptSubmit hooks. We run that child with CC_RENAME_CHILD=1 and the hook
+ * bails instantly on that flag, so a naming child can never spawn a grandchild —
+ * whether the parent is the inline hook or the detached worker.
  *
  * Zero dependencies. Debug: set CC_RENAME_DEBUG=1 to trace to ~/.claude/cc-rename.log.
  */
@@ -56,6 +58,11 @@ const DEBUG =
   process.env.CC_RENAME_DEBUG === '1' || fs.existsSync(path.join(HOME, '.claude', '.cc-rename-debug'));
 const CACHE_DIR = path.join(HOME, '.claude', '.cc-rename');
 const PENDING_STALE_MS = 90 * 1000; // a worker that hasn't finished in 90s is dead; retry.
+// Synchronous in-hook generation budget. The hook is configured with a 30s
+// timeout; we cap `claude -p` below that so a slow/cold run still leaves time to
+// fall back to the detached worker before CC kills the hook. This blocks the
+// FIRST prompt only (then the session is `applied` and the hook stays instant).
+const SYNC_GEN_TIMEOUT_MS = 22 * 1000;
 
 function log(...parts) {
   if (!DEBUG) return;
@@ -205,7 +212,7 @@ function sanitize(raw) {
   return s;
 }
 
-function generateName(userText, assistantText) {
+function generateName(userText, assistantText, timeoutMs) {
   const prompt = buildPrompt(userText, assistantText);
 
   let res;
@@ -213,7 +220,7 @@ function generateName(userText, assistantText) {
     res = spawnSync('claude', ['-p', '--model', 'haiku'], {
       input: prompt,
       encoding: 'utf8',
-      timeout: 60000, // generous: we're detached, nothing is waiting on us.
+      timeout: timeoutMs || 60000, // detached worker: generous. Hook (sync): bounded.
       maxBuffer: 4 * 1024 * 1024,
       windowsHide: true,
       // shell:true is required on Windows to invoke claude.cmd (Node refuses to
@@ -379,6 +386,24 @@ function spawnWorker(sessionId, transcriptPath) {
 
 // ---- hook mode --------------------------------------------------------------
 
+// Tell Claude Code to set the live session title. This is the ONLY channel that
+// updates the in-memory title shown on a running pane — an external roster write
+// updates the /resume list but not the live label. Marks the cache `applied` so
+// we never rename twice, and best-effort fills the roster for cross-version cover.
+function applyName(file, sessionId, name) {
+  writeCache(file, { status: 'applied', name: name, ts: Date.now() });
+  applyToRoster(sessionId, name);
+  log('emitting sessionTitle:', name);
+  process.stdout.write(
+    JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: 'UserPromptSubmit',
+        sessionTitle: name,
+      },
+    })
+  );
+}
+
 function runHook() {
   let data = {};
   try {
@@ -414,17 +439,8 @@ function runHook() {
   }
 
   if (cache && cache.status === 'ready' && cache.name) {
-    // Emit instantly and mark applied so we rename at most once.
-    writeCache(file, { status: 'applied', name: cache.name, ts: Date.now() });
-    log('emitting sessionTitle:', cache.name);
-    process.stdout.write(
-      JSON.stringify({
-        hookSpecificOutput: {
-          hookEventName: 'UserPromptSubmit',
-          sessionTitle: cache.name,
-        },
-      })
-    );
+    // A prior detached worker finished — emit instantly (no blocking this fire).
+    applyName(file, sessionId, cache.name);
     return;
   }
 
@@ -451,11 +467,25 @@ function runHook() {
     return;
   }
 
-  // Store the seed so the detached worker can name from it even if the transcript
-  // write is still racing behind us.
+  // Synchronous-first: try to generate the name inline and apply it THIS fire, so
+  // the rename lands after the very first prompt (the live pane title can only be
+  // set via this hook's sessionTitle output — no external process can update it).
+  // This blocks the first prompt for a few seconds, once per session. If it's too
+  // slow or fails, fall back to the non-blocking detached worker so the rename
+  // still lands on the next prompt.
+  log('synchronous generation for', sessionId, '(seeded from', info.firstUserText ? 'transcript)' : 'stdin prompt)');
+  const name = generateName(seed, info.firstAssistantText, SYNC_GEN_TIMEOUT_MS);
+  if (name) {
+    applyName(file, sessionId, name);
+    return;
+  }
+
+  // Inline generation didn't make it — hand off to the detached worker. It caches
+  // a `ready` name; the next prompt's hook emits it. Seed stored so the worker can
+  // name without waiting on the transcript write.
+  log('inline generation missed; falling back to detached worker for', sessionId);
   writeCache(file, { status: 'pending', ts: Date.now(), seedPrompt: seed });
   spawnWorker(sessionId, transcriptPath);
-  log('started detached generation for', sessionId, '(seeded from', info.firstUserText ? 'transcript)' : 'stdin prompt)');
 }
 
 // ---- entry ------------------------------------------------------------------

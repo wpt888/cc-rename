@@ -8,9 +8,8 @@ before:   ~/projects/api   (unnamed session)
 after:    ~/projects/api   fix-webhook-retry
 ```
 
-It's a single zero-dependency `UserPromptSubmit` hook. A few seconds into a session — once
-there's real context — it coins a short kebab-case title and sets it as the session title,
-exactly what `/rename` does manually.
+It's a single zero-dependency `UserPromptSubmit` hook. On your first prompt it coins a short
+kebab-case title and sets it as the session title — exactly what `/rename` does manually.
 
 ## How it works
 
@@ -20,31 +19,30 @@ Claude Code lets a `UserPromptSubmit` hook rename the current session by returni
 { "hookSpecificOutput": { "hookEventName": "UserPromptSubmit", "sessionTitle": "my-title" } }
 ```
 
-It is **non-blocking** — a `UserPromptSubmit` hook blocks the user's prompt until it returns,
-so it must be fast. Generating a name with `claude -p` takes several seconds (and can exceed
-the hook timeout on a cold start), so cc-rename never does it inline. Instead it splits the
-work across two prompts:
+The live title on a running pane is held in Claude Code's **memory**. The only thing that
+updates it is a hook emitting `sessionTitle`, and the only such hook that fires during a live
+session is `UserPromptSubmit`. A background process can write the roster file but **cannot**
+touch the live pane's label. So to rename after the **first** prompt, the hook produces the
+title itself, on that fire:
 
-1. Reads **this session's own** transcript (`transcript_path` from the hook payload).
-2. **Gate A** — if the transcript already has a `custom-title` entry (a manual `/rename`
-   *or* our own applied rename), it does nothing. This respects your manual names.
-3. The **first** time the session has real context, it writes a `pending` marker and spawns a
-   **detached background worker** that runs `claude -p --model haiku` (your **subscription**,
-   not the API) and caches a 2–4 word kebab-case title. The hook returns immediately, with no
-   output — your prompt is never blocked (measured ~60–90 ms).
-4. When the worker finishes (~15–20 s later), it writes the title **directly into the session's
-   roster file** (`~/.claude/sessions/<pid>.json`, the `name` field Claude Code shows in the
-   session list). Claude Code reflects that write in the live UI, so the rename appears after
-   the **first** prompt — no second prompt required. The write is a read-merge-write that only
-   fills `name` when it's empty, so a manual `/rename` is never clobbered.
-5. On the **next** prompt, the hook also emits the cached name as the `sessionTitle`. This is
-   the durable layer: it writes a `custom-title` transcript entry (which the roster write does
-   not) and marks the session `applied`, so the rename survives and fires **at most once**.
+1. **Gate A** — if the session already has a `custom-title` (a manual `/rename` *or* our own
+   applied rename), it does nothing. This respects your manual names.
+2. On the **first** prompt with real context, the hook generates a 2–4 word title **inline**
+   with `claude -p --model haiku` (your **subscription**, not the API) and emits it as
+   `sessionTitle`. The pane renames immediately. The naming text is seeded from the `prompt`
+   field of the hook payload, since `UserPromptSubmit` fires *before* the prompt reaches the
+   transcript.
+3. It marks the session `applied` and best-effort writes the roster `name` (so the `/resume`
+   list shows it too). Renames **at most once**; never clobbers a manual rename.
 
-So the rename lands shortly after the very first prompt, with zero blocking and no dependency on
-`claude -p` beating a timeout. Each open window names **itself** from **its own** transcript;
-there is no shared/static name, so one window never renames another. Per-session cache lives in
-`~/.claude/.cc-rename/`.
+This blocks your **first** prompt for a few seconds (while `claude -p` runs) — once per session;
+afterwards the hook is instant. If inline generation is slow (it's capped under the hook
+timeout) or fails, the hook falls back to a **detached background worker** that caches the name,
+and the **next** prompt emits it — so the rename still lands, just one prompt later, and a
+slow/cold `claude -p` never breaks your prompt.
+
+Each open window names **itself** from **its own** context; there is no shared/static name, so
+one window never renames another. Per-session cache lives in `~/.claude/.cc-rename/`.
 
 ### Why per-session, and why those two gates
 
@@ -106,10 +104,10 @@ groups):
 
 - **Cost** — name generation uses `claude -p --model haiku` on your Max/Pro subscription, not
   the metered API.
-- **Latency** — the hook itself is always near-instant (~60–90 ms); the slow `claude -p` runs
-  in a detached background process, so your prompt is never blocked. The rename appears ~15–20 s
-  after your first prompt (when the worker writes the roster file), and is re-confirmed durably
-  on your next prompt.
+- **Latency** — your **first** prompt is held a few seconds while `claude -p` generates the
+  name (this is what lets the rename land on that first prompt). It happens once per session;
+  every later prompt is instant. If generation runs long, it's capped under the hook timeout and
+  falls back to a background worker that applies the name on your next prompt.
 - **Debug** — set `CC_RENAME_DEBUG=1` to append a trace to `~/.claude/cc-rename.log`.
 - **Safety** — on any failure (model error, timeout, empty output) the hook stays silent and
   exits 0; it never breaks your prompt and simply retries on a later one. A dead background
