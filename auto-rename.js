@@ -19,9 +19,15 @@
  *     (this same file with `--generate`) that runs `claude -p --model haiku` in
  *     the background and writes the name to a per-session cache file. The hook
  *     returns with no output that fire.
- *   - On the next prompt, the hook finds the cached name and emits it as the
- *     sessionTitle instantly. So the rename lands one prompt after the first,
- *     with zero blocking and no dependency on `claude -p` beating a timeout.
+ *   - When the worker finishes (~15-20s later) it ALSO writes the name straight
+ *     into the session's roster file (~/.claude/sessions/<pid>.json `name`), which
+ *     CC reflects in the live UI. So the rename lands after the FIRST prompt — no
+ *     second prompt needed. It's a read-merge-write, guarded to only fill an empty
+ *     `name`, so a manual /rename is never clobbered.
+ *   - On the next prompt, the hook also emits the cached name as the sessionTitle.
+ *     This is the durable layer: it writes a `custom-title` transcript entry (the
+ *     roster write does not) and marks the session applied, so the rename is
+ *     permanent and fires at most once. Zero blocking, no `claude -p` timeout race.
  *
  * Safety / one-shot:
  *   Gate A — if the transcript already has a `custom-title` entry (a manual
@@ -267,6 +273,57 @@ function removeCache(file) {
   }
 }
 
+// ---- roster apply (best-effort early rename, no 2nd prompt needed) -----------
+
+// Claude Code keeps a per-process "roster" file at ~/.claude/sessions/<pid>.json
+// whose `name` field is the title shown in the session list/tab. The hook's
+// official apply path emits `sessionTitle` on the NEXT prompt; that's durable
+// (CC also writes a `custom-title` transcript entry) but it needs a 2nd prompt.
+// To make the rename land after the FIRST prompt, the detached worker also
+// writes `name` straight into the roster here — a read-merge-write that keeps
+// every existing field and only fills `name` when it's empty (never clobbering a
+// manual /rename). This is purely additive: if CC ignores external roster writes
+// on a given version, the fire-2 sessionTitle path still applies the same name.
+function applyToRoster(sessionId, name) {
+  const dir = path.join(HOME, '.claude', 'sessions');
+  let files;
+  try {
+    files = fs.readdirSync(dir).filter((f) => f.endsWith('.json'));
+  } catch (e) {
+    log('roster dir unreadable', e && e.message);
+    return false;
+  }
+
+  for (const f of files) {
+    const full = path.join(dir, f);
+    let obj;
+    try {
+      obj = JSON.parse(fs.readFileSync(full, 'utf8'));
+    } catch (_) {
+      continue; // skip unreadable/partial roster files
+    }
+    if (!obj || obj.sessionId !== sessionId) continue;
+
+    if (obj.name) {
+      log('roster already named (', obj.name, '); not clobbering', f);
+      return false; // manual rename or already applied — leave it.
+    }
+
+    obj.name = name; // merge: every other field is preserved.
+    try {
+      fs.writeFileSync(full, JSON.stringify(obj));
+      log('roster applied name:', name, 'to', f, 'for', sessionId);
+      return true;
+    } catch (e) {
+      log('roster write failed', f, e && e.message);
+      return false;
+    }
+  }
+
+  log('no roster file matched sessionId', sessionId);
+  return false;
+}
+
 // ---- detached worker: generate the name and cache it ------------------------
 
 function runGenerator(sessionId, transcriptPath) {
@@ -287,6 +344,10 @@ function runGenerator(sessionId, transcriptPath) {
   if (name) {
     writeCache(file, { status: 'ready', name: name, ts: Date.now() });
     log('worker cached name:', name, 'for', sessionId);
+    // Best-effort early apply so the rename lands after the FIRST prompt. The
+    // cache stays `ready` (not `applied`) on purpose: the next-prompt hook still
+    // emits sessionTitle, which writes the durable custom-title transcript entry.
+    applyToRoster(sessionId, name);
   } else {
     removeCache(file); // failed; a later fire will restart generation.
     log('worker produced no name for', sessionId);

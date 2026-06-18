@@ -32,10 +32,16 @@ work across two prompts:
    **detached background worker** that runs `claude -p --model haiku` (your **subscription**,
    not the API) and caches a 2–4 word kebab-case title. The hook returns immediately, with no
    output — your prompt is never blocked (measured ~60–90 ms).
-4. On the **next** prompt, the hook finds the cached name and returns it as the `sessionTitle`
-   instantly, then marks the session `applied` so it renames **at most once**.
+4. When the worker finishes (~15–20 s later), it writes the title **directly into the session's
+   roster file** (`~/.claude/sessions/<pid>.json`, the `name` field Claude Code shows in the
+   session list). Claude Code reflects that write in the live UI, so the rename appears after
+   the **first** prompt — no second prompt required. The write is a read-merge-write that only
+   fills `name` when it's empty, so a manual `/rename` is never clobbered.
+5. On the **next** prompt, the hook also emits the cached name as the `sessionTitle`. This is
+   the durable layer: it writes a `custom-title` transcript entry (which the roster write does
+   not) and marks the session `applied`, so the rename survives and fires **at most once**.
 
-So the rename lands one prompt after the first — with zero blocking and no dependency on
+So the rename lands shortly after the very first prompt, with zero blocking and no dependency on
 `claude -p` beating a timeout. Each open window names **itself** from **its own** transcript;
 there is no shared/static name, so one window never renames another. Per-session cache lives in
 `~/.claude/.cc-rename/`.
@@ -101,8 +107,9 @@ groups):
 - **Cost** — name generation uses `claude -p --model haiku` on your Max/Pro subscription, not
   the metered API.
 - **Latency** — the hook itself is always near-instant (~60–90 ms); the slow `claude -p` runs
-  in a detached background process, so your prompt is never blocked. The rename appears one
-  prompt after the first.
+  in a detached background process, so your prompt is never blocked. The rename appears ~15–20 s
+  after your first prompt (when the worker writes the roster file), and is re-confirmed durably
+  on your next prompt.
 - **Debug** — set `CC_RENAME_DEBUG=1` to append a trace to `~/.claude/cc-rename.log`.
 - **Safety** — on any failure (model error, timeout, empty output) the hook stays silent and
   exits 0; it never breaks your prompt and simply retries on a later one. A dead background
