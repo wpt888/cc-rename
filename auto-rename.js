@@ -59,10 +59,11 @@ const DEBUG =
 const CACHE_DIR = path.join(HOME, '.claude', '.cc-rename');
 const PENDING_STALE_MS = 90 * 1000; // a worker that hasn't finished in 90s is dead; retry.
 // Synchronous in-hook generation budget. The hook is configured with a 30s
-// timeout; we cap `claude -p` below that so a slow/cold run still leaves time to
-// fall back to the detached worker before CC kills the hook. This blocks the
-// FIRST prompt only (then the session is `applied` and the hook stays instant).
-const SYNC_GEN_TIMEOUT_MS = 22 * 1000;
+// timeout; we cap `claude -p` well below that so a slow/cold run still leaves time
+// to fall back to the detached worker before CC kills the hook — and so the first
+// prompt never blocks for an unreasonable stretch. This blocks the FIRST prompt
+// only (then the session is `applied`/`pending` and the hook stays instant).
+const SYNC_GEN_TIMEOUT_MS = 15 * 1000;
 
 function log(...parts) {
   if (!DEBUG) return;
@@ -467,6 +468,12 @@ function runHook() {
     return;
   }
 
+  // Claim the slot BEFORE the (multi-second, blocking) inline generation. If the
+  // user fires another prompt while this one is still generating, that fire sees
+  // `pending` and waits instead of launching a second redundant `claude -p`. The
+  // seed is stored so the detached worker can name from it if we fall back.
+  writeCache(file, { status: 'pending', ts: Date.now(), seedPrompt: seed });
+
   // Synchronous-first: try to generate the name inline and apply it THIS fire, so
   // the rename lands after the very first prompt (the live pane title can only be
   // set via this hook's sessionTitle output — no external process can update it).
@@ -480,11 +487,10 @@ function runHook() {
     return;
   }
 
-  // Inline generation didn't make it — hand off to the detached worker. It caches
-  // a `ready` name; the next prompt's hook emits it. Seed stored so the worker can
-  // name without waiting on the transcript write.
+  // Inline generation didn't make it — hand off to the detached worker. The
+  // `pending` marker is already written above; the worker caches a `ready` name
+  // and the next prompt's hook emits it.
   log('inline generation missed; falling back to detached worker for', sessionId);
-  writeCache(file, { status: 'pending', ts: Date.now(), seedPrompt: seed });
   spawnWorker(sessionId, transcriptPath);
 }
 
