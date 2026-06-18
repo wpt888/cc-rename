@@ -17,6 +17,14 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Write JSON as UTF-8 WITHOUT a BOM. Windows PowerShell 5.1's
+# `Set-Content -Encoding utf8` prepends a BOM, which some JSON parsers (and Claude
+# Code's settings reader) can choke on. This keeps settings.json clean everywhere.
+function Write-JsonNoBom([string]$Path, $Object) {
+  $text = $Object | ConvertTo-Json -Depth 100
+  [System.IO.File]::WriteAllText($Path, $text, (New-Object System.Text.UTF8Encoding($false)))
+}
+
 $scriptDir    = Split-Path -Parent $MyInvocation.MyCommand.Path
 $autoRenameJs = Join-Path $scriptDir 'auto-rename.js'
 if (-not (Test-Path $autoRenameJs)) {
@@ -65,7 +73,7 @@ foreach ($group in @($hooks.UserPromptSubmit)) {
 
 if ($Uninstall) {
   $hooks.UserPromptSubmit = @($kept)
-  $json | ConvertTo-Json -Depth 100 | Set-Content $settingsPath -Encoding utf8
+  Write-JsonNoBom $settingsPath $json
   Write-Host "cc-rename hook removed. Start a new Claude Code session to apply."
   exit 0
 }
@@ -82,7 +90,7 @@ $ourGroup = [PSCustomObject]@{
 }
 $hooks.UserPromptSubmit = @($kept) + $ourGroup
 
-$json | ConvertTo-Json -Depth 100 | Set-Content $settingsPath -Encoding utf8
+Write-JsonNoBom $settingsPath $json
 Write-Host "cc-rename installed. Start a new Claude Code session to activate."
 Write-Host "Command: $command"
 Write-Host "Debug:   set CC_RENAME_DEBUG=1 to trace to ~/.claude/cc-rename.log"
